@@ -1,8 +1,7 @@
 <?php
 // Configuración detallada de errores
 error_reporting(E_ALL);
-ini_set('display_errors', 1);
-ini_set('display_startup_errors', 1);
+ini_set('display_errors', 0); // Ocultar errores en el HTML/JSON final
 ini_set('log_errors', 1);
 ini_set('error_log', __DIR__ . '/php_errors.log');
 
@@ -13,15 +12,30 @@ function forceNoCache() {
     header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
     header('Pragma: no-cache');
     header('Expires: 0');
-    header('Last-Modified: ' . gmdate('D, d M Y H:i:s') . ' GMT');
 }
-function forceClearCaches() {
-    clearstatcache(true);
-    if (function_exists('apcu_clear_cache')) { @apcu_clear_cache(); }
-    elseif (function_exists('apc_clear_cache')) { @apc_clear_cache(); @apc_clear_cache('user'); }
-    if (function_exists('opcache_reset')) { @opcache_reset(); }
+function jsonResponse($data, $status = 200) {
+    forceNoCache();
+    header('Content-Type: application/json; charset=utf-8');
+    http_response_code($status);
+    echo json_encode($data, JSON_UNESCAPED_UNICODE);
+    exit;
 }
-forceNoCache();
+
+// --- LÓGICA DE EXTRACCIÓN Y HELPER FUNCTIONS ---
+function extract_regimenes_list($html): array {
+    $regimenes = [];
+    if (empty($html)) return [];
+    $cleanHtml = preg_replace('/\s+/', ' ', $html);
+    preg_match_all('/Régimen:.*?<\/td>\s*<td[^>]*>(.*?)<\/td>.*?Fecha de alta:.*?<\/td>\s*<td[^>]*>(.*?)<\/td>(?:.*?Fecha de baja:.*?<\/td>\s*<td[^>]*>(.*?)<\/td>)?/is', $cleanHtml, $matches, PREG_SET_ORDER);
+    foreach ($matches as $m) {
+        $regimenes[] = [
+            'regimen' => preg_replace('/\bRégimen\s*:\s*/iu', '', trim(strip_tags($m[1]))),
+            'fecha_inicio' => preg_replace('/\bFecha\s+de\s+alta\s*:\s*/iu', '', trim(strip_tags($m[2]))),
+            'fecha_fin' => isset($m[3]) ? preg_replace('/\bFecha\s+de\s+baja\s*:\s*/iu', '', trim(strip_tags($m[3]))) : ''
+        ];
+    }
+    return $regimenes;
+}
 
 // === Normalización y extracción defensiva ===
 function normalize_sat_html(string $html): string {
@@ -32,196 +46,195 @@ function normalize_sat_html(string $html): string {
     $text = preg_replace("/\r\n|\r/", "\n", $text);
     $text = preg_replace("/[ \t]+/", " ", $text);
     $text = preg_replace("/\n{2,}/", "\n", $text);
-    // Remover bloques JS conocidos que ensucian el texto
     $text = preg_replace('/\$\s*\(function\s*\(\)\s*\{[\s\S]*?\}\s*\)\s*;?/u', '', $text);
     $text = preg_replace('/PrimeFaces\.cw\([^\)]*\);\s*/ui', '', $text);
     return trim($text);
 }
+
 function extract_label_value(string $text, string $html, array $labels): string {
     foreach ($labels as $lbl) {
-        $patternText = '/^\s*' . preg_quote($lbl, '/') . '\s*:\s*(.*?)\s*$/imu';
-        if (preg_match($patternText, $text, $m)) { return trim($m[1]); }
+        $patternSameLine = '/' . preg_quote($lbl, '/') . '\s*[:\s]\s*([^\n\r<]+)/iu';
+        if (preg_match($patternSameLine, $text, $m)) return trim($m[1]); 
+        $patternNextLine = '/' . preg_quote($lbl, '/') . '\s*[:\s]*[\r\n]+\s*([^\n\r<]+)/iu';
+        if (preg_match($patternNextLine, $text, $m)) return trim($m[1]);
         if ($html !== '') {
-            $patternHtml = '/'.preg_quote($lbl, '/').'\s*:\s*(?:<\/?\w+[^>]*>\s*)*([^<\n]+)/imu';
-            if (preg_match($patternHtml, $html, $mh)) { return trim(html_entity_decode($mh[1], ENT_QUOTES | ENT_HTML5, 'UTF-8')); }
+            $patternHtml = '/'.preg_quote($lbl, '/').'\s*[:\s]*\s*(?:<\/?\w+[^>]*>\s*)*([^<>\n\r]+)/iu';
+            if (preg_match($patternHtml, $html, $mh)) return trim(html_entity_decode($mh[1], ENT_QUOTES | ENT_HTML5, 'UTF-8')); 
         }
     }
     return '';
 }
-function sanitize_value(string $value, array $knownLabels): string {
+
+function sanitize_value(string $value, array $allPossibleLabels): string {
     $v = $value;
-    foreach ($knownLabels as $lbl) {
-        $pos = mb_stripos($v, $lbl . ':');
-        if ($pos !== false) { $v = trim(mb_substr($v, 0, $pos)); }
+    // Si el valor contiene otra etiqueta (desfase de extracción)
+    foreach ($allPossibleLabels as $label) {
+        $cleanLabel = mb_strtolower(trim($label));
+        $vLower = mb_strtolower($v);
+        $pos = mb_strpos($vLower, $cleanLabel . ':');
+        if ($pos !== false) $v = mb_substr($v, 0, $pos);
     }
+    // Limpiar etiquetas redundantes conocidas que el SAT inserta en las celdas
     $v = preg_replace('/\bFecha\s+de\s+alta\s*:\s*/iu', '', $v);
+    $v = preg_replace('/\bRégimen\s*:\s*/iu', '', $v);
+    $v = str_replace([':', '"', "'"], '', $v);
     return trim($v);
 }
+
 function extract_sat_data($html): array {
     $text = ($html !== false && $html !== null) ? normalize_sat_html($html) : '';
     $labels = [
         'CURP' => ['CURP'],
         'Nombre' => ['Nombre', 'Nombre(s)', 'Denominación o Razón Social'],
-        'Apellido Paterno' => ['Apellido Paterno'],
-        'Apellido Materno' => ['Apellido Materno'],
-        'Fecha de Inicio de operaciones' => ['Fecha de Inicio de operaciones'],
-        'Situación del contribuyente' => ['Situación del contribuyente'],
-        'Fecha del último cambio de situación' => ['Fecha del último cambio de situación'],
-        'Entidad Federativa' => ['Entidad Federativa'],
-        'Municipio o delegación' => ['Municipio o delegación'],
-        'Colonia' => ['Colonia'],
-        'Tipo de vialidad' => ['Tipo de vialidad'],
-        'Nombre de la vialidad' => ['Nombre de la vialidad'],
-        'Número exterior' => ['Número exterior'],
-        'Número interior' => ['Número interior'],
-        'CP' => ['CP'],
+        'Apellido Paterno' => ['Apellido Paterno', 'PrimerApellido'],
+        'Apellido Materno' => ['Apellido Materno', 'SegundoApellido'],
+        'Fecha de Inicio de operaciones' => ['Fecha de Inicio de operaciones', 'Fechainiciodeoperaciones'],
+        'Situación del contribuyente' => ['Situación del contribuyente', 'Estatusenelpadrón', 'Situación'],
+        'Fecha del último cambio de situación' => ['Fecha del último cambio de situación', 'Fechadeúltimocambiodeestado'],
+        'Entidad Federativa' => ['Entidad Federativa', 'NombredelaEntidadFederativa'],
+        'Municipio o Demarcación Territorial' => ['Municipio o delegación', 'Municipio', 'NombredelMunicipiooDemarcaciónTerritorial', 'Delegación', 'Municipio o Delegación'],
+        'Nombre de la Localidad' => ['Nombre de la Localidad', 'Localidad', 'NombredelaLocalidad'],
+        'Colonia' => ['Colonia', 'NombredelaColonia'],
+        'Tipo de vialidad' => ['Tipo de vialidad', 'TipodeVialidad'],
+        'Nombre de la vialidad' => ['Nombre de la vialidad', 'NombredeVialidad'],
+        'Número exterior' => ['Número exterior', 'NúmeroExterior'],
+        'Número interior' => ['Número interior', 'NúmeroInterior'],
+        'CP' => ['CP', 'CódigoPostal'],
         'Correo electrónico' => ['Correo electrónico'],
         'AL' => ['AL'],
-        'Régimen' => ['Régimen'],
-        'Nombre de la Localidad' => ['Nombre de la Localidad'],
-        'Entre Calle' => ['Entre Calle'],
+        'Régimen' => ['Régimen', 'Regímenes', 'Régimen Fiscal'],
+        'Entre Calle' => ['Entre Calle', 'Entre calle', 'Entre calles', 'EntreCalle'],
+        'Y Calle' => ['Y Calle', 'Y calle', 'YCalle'],
+        'Lugar y Fecha de Emisión' => ['Lugar y fecha de emisión', 'Fecha de emisión'],
     ];
     $data = [];
     foreach ($labels as $key => $choices) {
-        $data[$key] = extract_label_value($text, $html, $choices);
+        $val = extract_label_value($text, $html, $choices);
+        if ($val === '') {
+            foreach ($choices as $choice) {
+                // Buscar la etiqueta sin espacios ni acentos por si el HTML viene compactado
+                $compactChoice = preg_replace('/[^a-z0-9]/i', '', $choice);
+                $pattern = '/' . preg_quote($choice, '/') . '\s*[:\s]*([^\n\r<]+)/iu';
+                if (preg_match($pattern, $text, $m)) { $val = trim($m[1]); break; }
+            }
+        }
+        $data[$key] = $val;
     }
-    $allLabels = [];
-    foreach ($labels as $choices) {
-        foreach ($choices as $lbl) { $allLabels[] = $lbl; }
+
+    // Unificación solicitada: Localidad y Demarcación Territorial suelen ser lo mismo
+    if (empty($data['Nombre de la Localidad']) && !empty($data['Municipio o Demarcación Territorial'])) {
+        $data['Nombre de la Localidad'] = $data['Municipio o Demarcación Territorial'];
     }
-    foreach ($data as $k => $v) { $data[$k] = sanitize_value($v, $allLabels); }
+
+    // Fallback específico para Lugar y Fecha de Emisión si no se detectó
+    if (empty($data['Lugar y Fecha de Emisión'])) {
+        $pattern = '/([A-Z\s,]+A\s+\d{1,2}\s+DE\s+[A-Z]+\s+DE\s+\d{4})/u';
+        if (preg_match($pattern, $text, $m)) {
+            $data['Lugar y Fecha de Emisión'] = trim($m[1]);
+        } else {
+            // Último recurso: Generar uno basado en la fecha actual si es para la visualización
+            $meses = ["ENERO","FEBRERO","MARZO","ABRIL","MAYO","JUNIO","JULIO","AGOSTO","SEPTIEMBRE","OCTUBRE","NOVIEMBRE","DICIEMBRE"];
+            $fecha = date('d') . " DE " . $meses[date('n')-1] . " DE " . date('Y');
+            $data['Lugar y Fecha de Emisión'] = "CIUDAD DE MEXICO A " . $fecha;
+        }
+    }
+
+    $allLabelsFlat = [];
+    foreach ($labels as $choices) { foreach ($choices as $lbl) { $allLabelsFlat[] = $lbl; } }
+    foreach ($data as $k => $v) { $data[$k] = sanitize_value($v, $allLabelsFlat); }
+    
+    // Agregar la lista detallada de regímenes
+    $regList = extract_regimenes_list($html);
+    $data['RegimenesList'] = $regList;
+    
+    // Sobrescribir el campo de Régimen principal con el último encontrado (solicitado para el PDF)
+    if (!empty($regList)) {
+        $lastReg = end($regList);
+        $data['Régimen'] = $lastReg['regimen'];
+    }
     return $data;
 }
-function fetchHtml(string $url, ?array &$debug = null) {
+
+function fetchHtml(string $url) {
+    // Implementación simplificada compatible
     $headers = [
-        'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        'Accept-Language: es-MX,es;q=0.9',
-        'Connection: keep-alive',
-        'Cache-Control: no-cache',
-        'Pragma: no-cache',
+        'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) width=device-width',
+        'Accept: text/html,application/xhtml+xml',
     ];
-    if (function_exists('curl_init')) {
-        $ch = curl_init($url);
-        curl_setopt_array($ch, [
-            CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_FOLLOWLOCATION => true,
-            CURLOPT_MAXREDIRS => 3,
-            CURLOPT_USERAGENT => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36',
-            CURLOPT_HTTPHEADER => $headers,
-            CURLOPT_SSL_VERIFYPEER => true,
-            CURLOPT_SSL_VERIFYHOST => 2,
-            CURLOPT_TIMEOUT => 15,
-            CURLOPT_CONNECTTIMEOUT => 10,
-            CURLOPT_ENCODING => '',
-            CURLOPT_IPRESOLVE => CURL_IPRESOLVE_V4,
-            CURLOPT_PROTOCOLS => CURLPROTO_HTTPS,
-            CURLOPT_HTTP_VERSION => CURL_HTTP_VERSION_1_1,
-            CURLOPT_REFERER => 'https://siat.sat.gob.mx/',
-            CURLOPT_SSL_CIPHER_LIST => 'DEFAULT:!DH',
-            CURLOPT_SSLVERSION => CURL_SSLVERSION_TLSv1_2,
-            CURLOPT_FRESH_CONNECT => true,
-            CURLOPT_FORBID_REUSE => true,
-        ]);
-        $resp = curl_exec($ch);
-        $err = curl_error($ch);
-        $status = curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
-        curl_close($ch);
-        if ($resp !== false && $resp !== '' && $status === 200) {
-            if ($debug !== null) { $debug['status'] = $status; }
-            return $resp;
-        }
-        // Fallback inseguro: se registra explícitamente
-        $ch = curl_init($url);
-        curl_setopt_array($ch, [
-            CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_FOLLOWLOCATION => true,
-            CURLOPT_MAXREDIRS => 3,
-            CURLOPT_USERAGENT => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36',
-            CURLOPT_HTTPHEADER => $headers,
-            CURLOPT_SSL_VERIFYPEER => false,
-            CURLOPT_SSL_VERIFYHOST => 0,
-            CURLOPT_TIMEOUT => 15,
-            CURLOPT_CONNECTTIMEOUT => 10,
-            CURLOPT_ENCODING => '',
-            CURLOPT_IPRESOLVE => CURL_IPRESOLVE_V4,
-            CURLOPT_PROTOCOLS => CURLPROTO_HTTPS,
-            CURLOPT_HTTP_VERSION => CURL_HTTP_VERSION_1_1,
-            CURLOPT_REFERER => 'https://siat.sat.gob.mx/',
-            CURLOPT_SSL_CIPHER_LIST => 'DEFAULT:!DH',
-            CURLOPT_SSLVERSION => CURL_SSLVERSION_TLSv1_2,
-            CURLOPT_FRESH_CONNECT => true,
-            CURLOPT_FORBID_REUSE => true,
-        ]);
-        $resp2 = curl_exec($ch);
-        $err2 = curl_error($ch);
-        $status2 = curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
-        curl_close($ch);
-        if ($debug !== null) {
-            $debug['status'] = $status2;
-            $debug['error'] = $err ?: $err2;
-            $debug['fallback_insecure'] = true;
-            $debug['fallback_reason'] = 'SSL estricto falló o respuesta vacía';
-        }
-        return $resp2;
-    }
-    $ctx = stream_context_create([
-        'http' => [
-            'method' => 'GET',
-            'header' => "User-Agent: Mozilla/5.0\r\nAccept: text/html\r\nAccept-Language: es-MX,es;q=0.9\r\n",
-            'timeout' => 15,
-        ],
-        'ssl' => [
-            'crypto_method' => defined('STREAM_CRYPTO_METHOD_TLSv1_2_CLIENT') ? STREAM_CRYPTO_METHOD_TLSv1_2_CLIENT : 0,
-            'ciphers' => 'DEFAULT:!DH',
-        ],
+    $ch = curl_init($url);
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_FOLLOWLOCATION => true,
+        CURLOPT_TIMEOUT => 20,
+        CURLOPT_SSL_VERIFYPEER => false,
+        CURLOPT_HTTPHEADER => $headers
     ]);
-    $resp = @file_get_contents($url, false, $ctx);
-    if ($resp !== false && $resp !== '') { return $resp; }
-    $ctx = stream_context_create([
-        'http' => [
-            'method' => 'GET',
-            'header' => "User-Agent: Mozilla/5.0\r\nAccept: text/html\r\nAccept-Language: es-MX,es;q=0.9\r\n",
-            'timeout' => 15,
-        ],
-        'ssl' => [
-            'verify_peer' => false,
-            'verify_peer_name' => false,
-            'crypto_method' => defined('STREAM_CRYPTO_METHOD_TLSv1_2_CLIENT') ? STREAM_CRYPTO_METHOD_TLSv1_2_CLIENT : 0,
-            'ciphers' => 'DEFAULT:!DH',
-        ],
-    ]);
-    $resp = @file_get_contents($url, false, $ctx);
-    if ($debug !== null) {
-        $debug['fallback_insecure'] = true;
-        $debug['fallback_reason'] = 'file_get_contents con SSL relajado';
-    }
+    $resp = curl_exec($ch);
+    curl_close($ch);
     return $resp;
 }
-// Función nativa para generar código QR simple (sin librerías externas)
 
-// Salida JSON pura cuando se solicita ?json=1 con idcif y rfc
-if (!empty($_GET['json']) && $_GET['json'] === '1' && !empty($_GET['idcif']) && !empty($_GET['rfc'])) {
-    $idcif = trim($_GET['idcif']);
-    $rfc   = trim($_GET['rfc']);
+function getPdfCoordMap() {
+    return [
+       'RFC' => ['x' => 206, 'y' => 246],
+       'CURP' => ['x' => 206, 'y' => 268],
+       'Nombre' => ['x' => 206, 'y' => 290],
+       'Apellido Paterno' => ['x' => 206, 'y' => 312],
+       'Apellido Materno' => ['x' => 206, 'y' => 334],
+       'Fecha de Inicio de operaciones' => ['x' => 206, 'y' => 356],
+       'Situación del contribuyente' => ['x' => 206, 'y' => 377],
+       'Fecha del último cambio de situación' => ['x' => 206, 'y' => 400],
+       'Nombre Comercial' => ['x' => 206, 'y' => 422],
+       'CP' => ['x' => 64, 'y' => 476],
+       'Nombre de la vialidad' => ['x' => 85, 'y' => 497],
+       'Nombre de la Localidad' => ['x' => 100, 'y' => 541],
+       'Entidad Federativa' => ['x' => 134, 'y' => 563],
+       'Tipo de vialidad' => ['x' => 346, 'y' => 476],
+       'Número exterior' => ['x' => 347, 'y' => 497],
+       'Número interior' => ['x' => 69, 'y' => 519],
+       'Colonia' => ['x' => 367, 'y' => 519],
+       'Municipio o Demarcación Territorial' => ['x' => 467, 'y' => 541],
+       'Entre Calle' => ['x' => 330, 'y' => 564],
+       'Y Calle' => ['x' => 330, 'y' => 586],
+       'Lugar y Fecha de Emisión' => ['x' => 100, 'y' => 740],
+    ];
+}
+
+// --- API ENDPOINT HANDLER ---
+// Si viene una petición POST o GET con json=1 para búsqueda
+if ($_SERVER['REQUEST_METHOD'] === 'POST' || (!empty($_GET['json']) && $_GET['json'] == 1)) {
+    $input = $_SERVER['REQUEST_METHOD'] === 'POST' ? $_POST : $_GET;
+    $idcif = trim($input['idcif'] ?? '');
+    $rfc = trim($input['rfc'] ?? '');
+    
+    // Validación Backend Básica
+    if (!preg_match('/^\d+$/', $idcif)) {
+        jsonResponse(['error' => 'El ID CIF debe contener solo números.'], 400);
+    }
+    // Validación Backend de RFC (Estructura)
+    if (!preg_match('/^([A-Z&]{3,4})([0-9]{2})(0[1-9]|1[0-2])(0[1-9]|[12][0-9]|3[01])([A-Z0-9]{3})$/', $rfc)) {
+        jsonResponse(['error' => 'El formato del RFC es inválido. Recuerde: 3-4 letras, 6 números y 3 caracteres de homoclave.'], 400);
+    }
+
     $baseUrl = 'https://siat.sat.gob.mx/app/qr/faces/pages/mobile/validadorqr.jsf?D1=10&D2=1&D3=';
     $link = $baseUrl . $idcif . '_' . $rfc;
-    $debug = [];
-    $html = fetchHtml($link, $debug);
+    
+    $html = fetchHtml($link);
     $data = extract_sat_data($html);
-    $coords = getPdfCoordMap();
-    // Faltantes
-    $faltantes = [];
-    foreach ($data as $campo => $valor) {
-        if ($valor === '' || $valor === null) {
-            if (isset($coords[$campo])) { $faltantes[] = ['campo' => $campo, 'x' => $coords[$campo]['x'], 'y' => $coords[$campo]['y']]; }
-        }
+    
+    // Validar si realmente obtuvimos datos
+    if (empty($data['Nombre']) && empty($data['Denominación o Razón Social'])) {
+        jsonResponse(['error' => '<b>¡No se encontraron datos!</b><br> Verifique su IdCIF y su RFC este correctos.'], 404);
     }
-    header('Content-Type: application/json; charset=utf-8');
-    header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
-    header('Pragma: no-cache');
-    header('Expires: 0');
-    echo json_encode(['rfc' => $rfc, 'data' => $data, 'faltantes' => $faltantes], JSON_UNESCAPED_UNICODE);
-    exit;
+
+    // Respuesta exitosa JSON
+    jsonResponse([
+        'data' => $data,
+        'coords' => getPdfCoordMap(),
+        'rfc' => $rfc,
+        'link' => $link,
+        'idCif' => $idcif
+    ]);
 }
 ?>
 <!doctype html>
@@ -231,436 +244,361 @@ if (!empty($_GET['json']) && $_GET['json'] === '1' && !empty($_GET['idcif']) && 
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Consulta SAT - Gobierno de México</title>
   <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
-  <script src="https://cdn.tailwindcss.com"></script>
-  <style>
-    :root{
-      --mx-guinda:#9D2449; --mx-guinda-osc:#7F1D3D; --mx-oro:#B38E5D; --mx-verde:#0A8F32;
-    }
-    .brand-gradient{ background:linear-gradient(90deg,var(--mx-guinda),var(--mx-guinda-osc)); }
-    .brand-btn{ background-color:var(--mx-verde); color:#fff; }
-    .brand-btn:hover{ background-color:#087428; color:#fff; }
-    .brand-accent{ color:var(--mx-oro); }
-    .card-shadow{ box-shadow:0 10px 25px rgba(0,0,0,.08); }
-  </style>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.2/font/bootstrap-icons.min.css">
+  <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;500;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="css/styles.css">
+
 </head>
-<body class="bg-neutral-50 min-h-screen">
-  <header class="brand-gradient text-white">
-    <div class="container py-4">
-      <h1 class="h3 m-0 fw-bold tracking-wide">Consulta de RFC — Gobierno de México</h1>
-      <div class="brand-accent">Validador QR del SAT</div>
+<body class="bg-light min-vh-100 d-flex flex-column">
+  
+  <header class="brand-gradient text-white shadow-sm">
+    <div class="container py-3 d-flex align-items-center justify-content-between">
+      <div class="d-flex align-items-center gap-4">
+        <div>
+          <h1 class="h6 m-0 fw-bold" style="letter-spacing: -0.025em;">Cédula de Identificación Fiscal</h1>
+          <small class="brand-accent text-uppercase" style="font-size: 0.75rem; letter-spacing: 0.5px;">Validador QR del SAT</small>
+        </div>
+      </div>
+      <div class="d-none d-md-block text-end">
+        <div class="shcp-sub mb-1 text-uppercase">Secretaría de Hacienda</div>
+        <div class="shcp-logo fw-bold">SHCP | SAT</div>
+      </div>
     </div>
   </header>
-  <div class="container py-4">
-  <h1 class="h4 mb-3">Generar URL del SAT</h1>
 
-  <form method="get" class="row g-3">
-    <div class="col-12 col-md-4">
-      <label class="form-label">ID CIF</label>
-      <input type="text" name="idcif" class="form-control" required>
-    </div>
-    <div class="col-12 col-md-4">
-      <label class="form-label">RFC</label>
-      <input type="text" name="rfc" class="form-control" required>
-    </div>
-    <div class="col-12 col-md-4 d-flex align-items-end">
-      <button type="submit" class="btn brand-btn w-100 py-2">Generar link y extraer datos</button>
-    </div>
-  </form>
+  <div class="container py-5 flex-grow-1">
+      <div class="d-flex justify-content-between align-items-center mb-4">
+        <h1 class="h4 m-0 fw-bold text-secondary text-opacity-75">Generador de Constancia (CSF)</h1>
+      </div>
 
-  <hr class="my-4">
+      <div class="card shadow-sm border-0 mb-3">
+          <div class="card-body p-4">
+              <!-- Se cambió align-items-end a align-items-start para evitar saltos por validación -->
+              <form id="csfForm" class="row g-4 align-items-start" novalidate>
+                  <div class="col-12 col-md-5">
+                      <label for="idcif" class="form-label fw-bold small text-muted text-uppercase" style="letter-spacing: 0.05em;">ID CIF</label>
+                      <input type="text" id="idcif" name="idcif" class="form-control form-control-md bg-light border-0" 
+                             placeholder="Ej: 17030158688" 
+                             required pattern="\d+" 
+                             title="Solo se permiten números"
+                             oninput="this.value = this.value.replace(/[^0-9]/g, '');">
+                      <div class="invalid-feedback">El ID CIF debe contener solo números.</div>
+                  </div>
+                  <div class="col-12 col-md-4">
+                      <label for="rfc" class="form-label fw-bold small text-muted text-uppercase" style="letter-spacing: 0.05em;">RFC</label>
+                      <input type="text" id="rfc" name="rfc" class="form-control form-control-md bg-light border-0 text-uppercase" 
+                             placeholder="Ej: GOAA850204DN3" 
+                             required minlength="12" maxlength="13"
+                             oninput="this.value = this.value.toUpperCase();">
+                       <div class="invalid-feedback">El RFC debe tener entre 12 (Moral) y 13 (Física) caracteres.</div>
+                  </div>
+                  <!-- Contenedor del botón con mt-md-4 para alineación visual con labels -->
+                  <div class="col-12 col-md-3"> 
+                    <label class="form-label fw-bold small text-muted text-uppercase"></label>
+                      <button type="submit" id="btnSearch" class="btn brand-btn w-100 py-2 fw-bold d-flex align-items-center justify-content-center gap-2 shadow-sm">
+                          <span class="submit-text"><i class="bi bi-search"></i> GENERAR VALIDACIÓN</span>
+                          <span class="spinner-border spinner-border-sm d-none" role="status" aria-hidden="true"></span>
+                      </button>
+                  </div>
+              </form>
+          </div>
+      </div>
 
-  <?php
-  // Modo descarga directa: no guarda en disco, entrega el PDF en memoria
-  if (!empty($_GET['dl']) && $_GET['dl'] === '1' && !empty($_GET['idcif']) && !empty($_GET['rfc'])) {
-      $idcif = trim($_GET['idcif']);
-      $rfc   = trim($_GET['rfc']);
-      $baseUrl = 'https://siat.sat.gob.mx/app/qr/faces/pages/mobile/validadorqr.jsf?D1=10&D2=1&D3=';
-      $link = $baseUrl . $idcif . '_' . $rfc;
-      // Reutilizamos funciones más abajo para extracción
-  }
-  if (!empty($_GET['idcif']) && !empty($_GET['rfc'])) {
-      $idcif = trim($_GET['idcif']);
-      $rfc   = trim($_GET['rfc']);
+      <!-- Contenedor de Resultados (Oculto inicialmente) -->
+      <div id="resultContainer" class="row justify-content-center d-none">
+        <div class="col-12 col-lg-10">
+          
+          <!-- Componente de Alerta de Estatus -->
+          <div id="statusAlert" class="mb-3"></div>
 
-      // Base oficial del validador QR del SAT
-      $baseUrl = 'https://siat.sat.gob.mx/app/qr/faces/pages/mobile/validadorqr.jsf?D1=10&D2=1&D3=';
-
-      // D3 = idcif_rfc (con guion bajo entre ambos)
-      $link = $baseUrl . $idcif . '_' . $rfc;
-
-      $debug = [];
-      $html = fetchHtml($link, $debug);
-      $data = extract_sat_data($html);
-      function pdf_escape($s) {
-          $s = str_replace('\\', '\\\\', $s);
-          $s = str_replace('(', '\\(', $s);
-          $s = str_replace(')', '\\)', $s);
-          $s = str_replace("\r", ' ', $s);
-          $s = str_replace("\n", ' ', $s);
-          return $s;
-      }
-      // Función nativa simple para generar código QR básico (sin librerías externas)
-      function generateSimpleQR($url, $size = 3) {
-          // Implementación básica de código QR usando GD nativo
-          $qrSize = 21; // Tamaño mínimo para QR versión 1
-          $qr = imagecreatetruecolor($qrSize, $qrSize);
-          
-          // Colores: blanco para fondo, negro para módulos
-          $white = imagecolorallocate($qr, 255, 255, 255);
-          $black = imagecolorallocate($qr, 0, 0, 0);
-          
-          // Fondo blanco
-          imagefill($qr, 0, 0, $white);
-          
-          // Patrón básico de prueba (en producción se usaría un algoritmo real)
-          // Esto es solo un placeholder - para QR reales necesitarías implementar
-          // el algoritmo completo de codificación QR o usar un servicio externo
-          for ($i = 0; $i < $qrSize; $i += 3) {
-              for ($j = 0; $j < $qrSize; $j += 3) {
-                  if (($i + $j) % 6 == 0) {
-                      imagefilledrectangle($qr, $i, $j, $i+2, $j+2, $black);
-                  }
-              }
-          }
-          
-          // Convertir a base64
-          ob_start();
-          imagepng($qr);
-          $imageData = ob_get_clean();
-          imagedestroy($qr);
-          
-          return 'data:image/png;base64,' . base64_encode($imageData);
-      }
-
-      // Alias para compatibilidad
-      function generateQRImage($url, $size = 200) {
-          return generateSimpleQR($url, $size);
-      }
-      
-      function generateQRBase64($url, $size = 200) {
-          return generateSimpleQR($url, $size);
-      }
-
-      // Devuelve el mapa de coordenadas fijas (x,y) de cada campo en la plantilla rfcblanco.pdf
-      function getPdfCoordMap() {
-          return [
-              // ===== DATOS DE IDENTIFICACIÓN =====
-              'RFC' => ['x' => 237, 'y' => 565],
-              'CURP' => ['x' => 237, 'y' => 547],
-              'Nombre' => ['x' => 237, 'y' => 529],
-              'Apellido Paterno' => ['x' => 237, 'y' => 506],
-              'Apellido Materno' => ['x' => 237, 'y' => 483],
-              'Fecha de Inicio de operaciones' => ['x' => 237, 'y' => 458],
-              'Situación del contribuyente' => ['x' => 237, 'y' => 427],
-              'Fecha del último cambio de situación' => ['x' => 237, 'y' => 405],
-              'Nombre Comercial' => ['x' => 237, 'y' => 382],
-              'Régimen' => ['x' => 237, 'y' => 360],
-              
-              // ===== DOMICILIO FISCAL =====
-              'CP' => ['x' => 238, 'y' => 325],
-              'Tipo de vialidad' => ['x' => 130, 'y' => 329],
-              'Nombre de la vialidad' => ['x' => 116, 'y' => 228],
-              'Número exterior' => ['x' => 360, 'y' => 311],
-              'Número interior' => ['x' => 0, 'y' => 206],
-              'Colonia' => ['x' => 180, 'y' => 293],
-              'Nombre de la Localidad' => ['x' => 132, 'y' => 184],
-              'Municipio o delegación' => ['x' => 360, 'y' => 270],
-              'Entidad Federativa' => ['x' => 100, 'y' => 247],
-              'Entre Calle' => ['x' => 360, 'y' => 247],
-              'Correo electrónico' => ['x' => 130, 'y' => 224],
-              'AL' => ['x' => 360, 'y' => 224],
-          ];
-      }
-      function getContentBox() {
-          return ['x' => 31, 'y' => 68, 'width' => 550, 'height' => 690];
-      }
-      function toPdfCoordFromTop($x, $y, $pageHeight = 842, $box = null) {
-          $bx = is_array($box) && isset($box['x']) ? $box['x'] : 0;
-          $by = is_array($box) && isset($box['y']) ? $box['y'] : 0;
-          return ['x' => ($bx + $x), 'y' => ($pageHeight - ($by + $y))];
-      }
-      function generate_csf_pdf_bytes($rfc, $data) {
-          $objects = [];
-          $pdf = "%PDF-1.4\n";
-          $offsets = [];
-          $addObj = function($obj) use (&$objects) { $objects[] = $obj; };
-          $addObj("1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
-          $addObj("2 0 obj\n<< /Type /Pages /Kids [3 0 R 6 0 R] /Count 2 >>\nendobj\n");
-          $addObj("4 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n");
-          
-          // Generar link del SIAT
-          $baseUrl = 'https://siat.sat.gob.mx/app/qr/faces/pages/mobile/validadorqr.jsf?D1=10&D2=1&D3=';
-          $siatLink = $baseUrl . $_GET['idcif'] . '_' . $rfc;
-          
-          // Obtener coordenadas fijas
-          $coords = getPdfCoordMap();
-          $box = getContentBox();
-          // Página 1: Contenido principal (texto únicamente)
-          $title = "Cédula de Identificación Fiscal — RFC ".strtoupper($rfc);
-          $ctitle = toPdfCoordFromTop($coords['RFC']['x'], $coords['RFC']['y'], 842, $box);
-          $stream1 = "BT /F1 9 Tf ".$ctitle['x']." ".$ctitle['y']." Td (".pdf_escape($title).") Tj ET\n";
-          
-          // Campos principales (sección de identificación)
-          $mainFields = [
-              'CURP','Nombre','Apellido Paterno','Apellido Materno',
-              'Fecha de Inicio de operaciones','Situación del contribuyente','Fecha del último cambio de situación','Régimen'
-          ];
-          
-          $addressCombinations = [];
-          
-          // Escribir campos principales (coordenadas capturadas arriba-izquierda convertidas a PDF)
-          foreach ($mainFields as $field) {
-              $val = isset($data[$field]) ? $data[$field] : '';
-              if ($val !== '') {
-                  $c = toPdfCoordFromTop($coords[$field]['x'], $coords[$field]['y'], 842, $box);
-                  $stream1 .= "BT /F1 8 Tf ".$c['x']." ".$c['y']." Td (".pdf_escape($val).") Tj ET\n";
-              }
-          }
-          
-          $individualAddressFields = ['CP', 'Tipo de vialidad', 'Nombre de la vialidad', 'Número exterior', 'Número interior', 'Colonia', 'Nombre de la Localidad', 'Municipio o delegación', 'Entidad Federativa', 'Entre Calle', 'Correo electrónico', 'AL'];
-          foreach ($individualAddressFields as $field) {
-              $val = isset($data[$field]) ? $data[$field] : '';
-              if ($val !== '') {
-                  $c = toPdfCoordFromTop($coords[$field]['x'], $coords[$field]['y'], 842, $box);
-                  $fs = ($field === 'CP') ? 7 : 8;
-                  $stream1 .= "BT /F1 ".$fs." Tf ".$c['x']." ".$c['y']." Td (".pdf_escape($val).") Tj ET\n";
-              }
-          }
-          
-          // Escribir combinaciones de campos de dirección
-          foreach ($addressCombinations as $combo) {
-              $vals = [];
-              foreach ($combo as $field) {
-                  $val = isset($data[$field]) ? $data[$field] : '';
-                  if ($val !== '') {
-                      $vals[] = $val;
-                  }
-              }
-              if (!empty($vals)) {
-                  $combinedText = implode(' ', $vals);
-                  // Usar coordenadas del primer campo de la combinación
-                  $firstField = $combo[0];
-                  $c = toPdfCoordFromTop($coords[$firstField]['x'], $coords[$firstField]['y'], 842, $box);
-                  $stream1 .= "BT /F1 8 Tf ".$c['x']." ".$c['y']." Td (".pdf_escape($combinedText).") Tj ET\n";
-              }
-          }
-          
-          // Omitir imágenes: no hay XObjects definidos
-          
-          $len1 = strlen($stream1);
-          $addObj("5 0 obj\n<< /Length ".$len1." >>\nstream\n".$stream1."endstream\nendobj\n");
-          $addObj("3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>\nendobj\n");
-          
-          // Página 2: QR grande en esquina superior derecha
-          $stream2 = "";
-          // Sin imágenes en página 2
-          
-          $len2 = strlen($stream2);
-          $addObj("7 0 obj\n<< /Length ".$len2." >>\nstream\n".$stream2."endstream\nendobj\n");
-          $addObj("6 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 4 0 R >> >> /Contents 7 0 R >>\nendobj\n");
-          $pos = strlen($pdf);
-          foreach ($objects as $obj) {
-              $offsets[] = $pos;
-              $pdf .= $obj;
-              $pos = strlen($pdf);
-          }
-          $xrefPos = strlen($pdf);
-          $pdf .= "xref\n0 ".(count($objects)+1)."\n";
-          $pdf .= "0000000000 65535 f \n";
-          foreach ($offsets as $off) {
-              $pdf .= sprintf("%010d 00000 n \n", $off);
-          }
-          $pdf .= "trailer\n<< /Size ".(count($objects)+1)." /Root 1 0 R >>\nstartxref\n".$xrefPos."\n%%EOF";
-          return $pdf;
-      }
-      // Modo JSON: devolver rfc, data y campos faltantes con coordenadas
-      if (!empty($_GET['json']) && $_GET['json'] === '1') {
-          $coords = getPdfCoordMap();
-          $faltantes = [];
-          foreach ($data as $campo => $valor) {
-              if ($valor === '' || $valor === null) {
-                  if (isset($coords[$campo])) {
-                      $faltantes[] = ['campo' => $campo, 'x' => $coords[$campo]['x'], 'y' => $coords[$campo]['y']];
-                  }
-              }
-          }
-          header('Content-Type: application/json; charset=utf-8');
-          echo json_encode(['rfc' => $rfc, 'data' => $data, 'faltantes' => $faltantes], JSON_UNESCAPED_UNICODE);
-          exit;
-      }
-      // Si es solicitud de descarga directa, emitir PDF y terminar
-      if (!empty($_GET['dl']) && $_GET['dl'] === '1') {
-          forceClearCaches();
-          forceNoCache();
-          $bytes = generate_csf_pdf_bytes($rfc, $data);
-          header('Content-Type: application/pdf');
-          header('Content-Disposition: attachment; filename="'.strtoupper($rfc).'_'.gmdate('Ymd_His').'.pdf"');
-          header('Content-Length: '.strlen($bytes));
-          echo $bytes;
-          exit;
-      }
-      // Generación local en memoria para descarga por JS
-      $bytes = generate_csf_pdf_bytes($rfc, $data);
-      $generated = ($bytes !== null && strlen($bytes) > 0);
-      ?>
-      <div class="border-top pt-3 mt-2">
-        <div class="fw-semibold mb-2">Documento</div>
-        <?php if ($generated): ?>
-          <div id="genModal" class="modal fade" tabindex="-1" aria-hidden="true">
-            <div class="modal-dialog modal-dialog-centered">
-              <div class="modal-content">
-                <div class="modal-header brand-gradient text-white">
-                  <h5 class="modal-title">Generación exitosa</h5>
-                  <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Close"></button>
-                </div>
-                <div class="modal-body">
-                  <p id="genModalMessage" class="m-0"></p>
-                </div>
+          <div class="card shadow border-0 overflow-hidden">
+            <div class="card-header text-white fw-bold d-flex justify-content-between align-items-center py-2" style="background-color: var(--mx-guinda-osc);">
+              <div class="d-flex align-items-center gap-3">
+                  <div class="bg-white text-dark rounded-circle d-flex align-items-center justify-content-center" style="width:32px; height:32px;">
+                    <i class="bi bi-file-earmark-pdf-fill"></i>
+                  </div>
+                  <span class="small" style="letter-spacing: 0.05em;">VISTA PREVIA DE CSF</span>
+              </div>
+              <div class="d-flex gap-2">
+                <button class="btn btn-sm btn-outline-light border-0 d-flex align-items-center gap-2 px-3" onclick="generatePdfPreview(false, 'ACTUALIZANDO DOCUMENTO...')" title="Refrescar">
+                  <i class="bi bi-arrow-clockwise"></i> <span class="d-none d-sm-inline">Actualizar</span>
+                </button>
+                <div class="vr bg-white opacity-25"></div>
+                <button id="btnDownload" class="btn btn-sm brand-btn fw-bold d-flex align-items-center gap-2 text-white px-3 shadow-none disabled" onclick="downloadPdf()" title="Descargar PDF" disabled>
+                  <i class="bi bi-download"></i> <span class="d-none d-sm-inline">Descargar PDF</span>
+                </button>
               </div>
             </div>
+            <div class="card-body p-0 bg-secondary bg-opacity-10 position-relative">
+               <div id="pdfLoader" class="position-absolute top-50 start-50 translate-middle text-center" style="z-index:10;">
+                   <div class="spinner-border text-dark" role="status" style="width: 3rem; height: 3rem;"></div>
+                   <div class="mt-3 fw-bold text-muted" style="letter-spacing: 0.05em;">GENERANDO DOCUMENTO...</div>
+               </div>
+               <iframe id="pdfViewer" style="width:100%; height:85vh; border:none; opacity:0; transition: opacity 0.5s;" src="about:blank" onload="document.getElementById('pdfLoader')?.classList.add('d-none'); this.style.opacity='1';"></iframe>
+            </div>
+            <div class="card-footer bg-white py-2 text-center text-muted small border-top">
+                Documento generado basado en datos oficiales del SAT. <span class="fw-bold" id="docNameFooter">CSF_Document.pdf</span>
+            </div>
           </div>
-          <script>
-            (function(){
-              const fullName = [<?= json_encode($data['Nombre']) ?>, <?= json_encode($data['Apellido Paterno']) ?>, <?= json_encode($data['Apellido Materno']) ?>].filter(Boolean).join(' ');
-              const msg = 'rfc de Nombre completo: ' + fullName + ' generado correctamente';
-              const payload = {
-                rfc: <?= json_encode($rfc) ?>,
-                data: <?= json_encode($data, JSON_UNESCAPED_UNICODE) ?>
-              };
-              const run = async function() {
-                const el = document.getElementById('genModalMessage');
-                if (el) el.textContent = msg;
-                const modalEl = document.getElementById('genModal');
-                if (modalEl && window.bootstrap && window.bootstrap.Modal) {
-                  const m = new bootstrap.Modal(modalEl);
-                  m.show();
-                  setTimeout(function(){ m.hide(); }, 3000);
-                }
-                // Generar PDF en el navegador usando rfcblanco.pdf como plantilla
-                if (!window.PDFLib) { console.error('PDFLib no cargado'); return; }
-                try {
-                  const templateResp = await fetch('rfcblanco.pdf?t=' + Date.now(), { cache: 'no-store' });
-                  const templateBuf = await templateResp.arrayBuffer();
-                  const { PDFDocument, rgb, StandardFonts } = PDFLib;
-                  const pdfDoc = await PDFDocument.load(templateBuf);
-                  const pages = pdfDoc.getPages();
-                  const page = pages[0];
-                  const helv = await pdfDoc.embedFont(StandardFonts.Helvetica);
-                  const contentBox = { x: 31, y: 68, width: 550, height: 690 };
-                  const toPdfCoord = (coord, pg) => ({ x: contentBox.x + coord.x, y: pg.getHeight() - (contentBox.y + coord.y) });
-                  // Coordenadas (origen abajo-izquierda) con caja de contenido
-                  const cRFC = toPdfCoord({ x: 237, y: 315 }, page);
-                  let yTop = cRFC.y;
-                  page.drawText(String(payload.rfc).toUpperCase(), { x: cRFC.x, y: cRFC.y, size: 9, font: helv, color: rgb(0.1,0.1,0.1) });
-                  if ((payload.data['CP'] || '').trim().length > 0) {
-                    const c = toPdfCoord({ x: 238, y: 325 }, page);
-                    page.drawText(String(payload.data['CP']), { x: c.x, y: c.y, size: 7, font: helv, color: rgb(0,0,0), maxWidth: 110 });
-                  }
-                  if ((payload.data['Nombre de la vialidad'] || '').trim().length > 0) {
-                    const c = toPdfCoord({ x: 116, y: 228 }, page);
-                    page.drawText(String(payload.data['Nombre de la vialidad']), { x: c.x, y: c.y, size: 8, font: helv, color: rgb(0,0,0) });
-                  }
-                  if ((payload.data['Número interior'] || '').trim().length > 0) {
-                    const c = toPdfCoord({ x: 0, y: 206 }, page);
-                    page.drawText(String(payload.data['Número interior']), { x: c.x, y: c.y, size: 8, font: helv, color: rgb(0,0,0) });
-                  }
-                  if ((payload.data['Nombre de la Localidad'] || '').trim().length > 0) {
-                    const c = toPdfCoord({ x: 132, y: 184 }, page);
-                    page.drawText(String(payload.data['Nombre de la Localidad']), { x: c.x, y: c.y, size: 8, font: helv, color: rgb(0,0,0) });
-                  }
-                  // Preparar dos bloques: principales y dirección/contacto aparte
-                  const mainFields = [
-                    'CURP','Nombre','Apellido Paterno','Apellido Materno',
-                    'Fecha de Inicio de operaciones','Situación del contribuyente','Fecha del último cambio de situación','Régimen'
-                  ];
-                  const orderedAddr = [
-                    { key: 'Número exterior' },
-                    { key: 'Municipio o delegación' },
-                    { key: 'Entidad Federativa' },
-                    { key: 'Entre Calle' }
-                  ];
-                  // Offsets personalizados (px): positivos = bajar, negativos = subir
-                  const yOffsets = {
-                    'Nombre': 2,
-                    'Apellido Paterno': 5,
-                    'Apellido Materno': 10,
-                    'Fecha de Inicio de operaciones': 12,
-                    'Situación del contribuyente': 18,
-                    'Fecha del último cambio de situación': 20
-                  };
-                  const startYMain = yTop - 22;
-                  const startYAddr = yTop - 22;
-                  const addrYOffset = 210;
-                  let yMain = startYMain;
-                  for (const key of mainFields) {
-                    const valText = (payload.data[key] || '');
-                    const off = (key in yOffsets) ? yOffsets[key] : 0;
-                    page.drawText(valText, { x: 237, y: yMain - off, size: 8, font: helv, color: rgb(0,0,0) });
-                    yMain -= 18;
-                    if (yMain < 60) break;
-                  }
-                  let yAddr = startYAddr;
-                  const dxMap = {
-                    'Entidad Federativa': -30
-                  };
-                  const dyMap = {
-                    'Entidad Federativa': 8
-                  };
-                  for (const item of orderedAddr) {
-                    let line = '';
-                    const val = payload.data[item.key] || '';
-                    line = val;
-                    let keyForOffsets = item.key ? item.key : '';
-                    const dx = dxMap[keyForOffsets] || 0;
-                    const dy = dyMap[keyForOffsets] || 0;
-                    page.drawText(line, { x: 130 + dx, y: (yAddr - addrYOffset) + dy, size: 8, font: helv, color: rgb(0,0,0) });
-                    yAddr -= 18;
-                    if (yAddr < 60) break;
-                  }
-                  const outBytes = await pdfDoc.save();
-                  const blob = new Blob([outBytes], { type: 'application/pdf' });
-                  const blobUrl = URL.createObjectURL(blob);
-                  const a = document.createElement('a');
-                  a.href = blobUrl;
-                  const fname = String(payload.rfc).toUpperCase() + '_' + Date.now() + '.pdf';
-                  a.download = fname;
-                  a.style.display = 'none';
-                  document.body.appendChild(a);
-                  a.click();
-                  URL.revokeObjectURL(blobUrl);
-                  a.remove();
-                } catch (e) {
-                  console.error('PDF generation error', e);
-                }
-              };
-              if (document.readyState === 'complete') run();
-              else window.addEventListener('load', run);
-            })();
-          </script>
-        <?php else: ?>
-          <div class="alert alert-danger">No fue posible generar el PDF.</div>
-        <?php endif; ?>
+        </div>
       </div>
-      <?php
-      $any = false;
-      foreach ($data as $v) { if ($v !== '') { $any = true; break; } }
-      if ($html === false || $html === '') {
-          echo '<div class="alert alert-danger mt-3">No se pudo obtener contenido del SAT.</div>';
-          if (!empty($debug)) {
-              echo '<div class="alert alert-warning">Detalle: ';
-              if (isset($debug['status'])) { echo 'HTTP '.$debug['status'].' '; }
-              if (!empty($debug['error'])) { echo htmlspecialchars($debug['error']); }
-              echo '</div>';
-          }
-          if (!function_exists('curl_init') && !filter_var(ini_get('allow_url_fopen'), FILTER_VALIDATE_BOOLEAN)) {
-              echo '<div class="alert alert-warning">PHP no tiene cURL y tiene deshabilitado allow_url_fopen.</div>';
-          }
-      } elseif (!$any) {
-          echo '<div class="alert alert-info mt-3">No se encontraron datos en el HTML devuelto.</div>';
+      
+      <!-- Mensaje Inicial -->
+      <div id="welcomeMessage" class="text-center mt-5 text-muted opacity-50">
+          <div class="display-1 mb-3"><i class="bi bi-qr-code-scan"></i></div>
+          <p class="h5">Ingrese sus datos para visualizar la constancia.</p>
+      </div>
+
+  </div>
+
+  <script src="https://unpkg.com/pdf-lib/dist/pdf-lib.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/bwip-js/dist/bwip-js-min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/sweetalert2@11"></script>
+
+  <!-- Script de Desarrollo (Carga directa para asegurar ver cambios) -->
+  <script src="js/app.js"></script>
+  <script>
+      // Fallback por si en algún momento se desea volver al minificado
+      if (typeof generatePdfPreview === 'undefined') {
+          console.warn('app.js no cargado, intentando fallback a minificado');
+          const script = document.createElement('script');
+          script.src = 'build/app.min.js';
+          document.body.appendChild(script);
       }
-      } // fin if (!empty(...))
-      ?>
-    <script src="https://unpkg.com/pdf-lib/dist/pdf-lib.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
-    </body>
+  </script>
+
+    <script>
+      /**
+       * Lógica Frontend de la Aplicación
+       * Gestiona la validación del formulario, las interacciones de entrada del usuario
+       * y la comunicación asíncrona con el backend para la generación de la CSF.
+       */
+      document.addEventListener('DOMContentLoaded', function() {
+        // Elementos del DOM
+        const form = document.getElementById('csfForm');
+        const btnSearch = document.getElementById('btnSearch');
+        const spinner = btnSearch.querySelector('.spinner-border');
+        const btnText = btnSearch.querySelector('.submit-text');
+        
+        const resultsContainer = document.getElementById('resultContainer');
+        const welcomeMessage = document.getElementById('welcomeMessage');
+        const statusAlert = document.getElementById('statusAlert'); // Contenedor para notificaciones de estado
+
+        const idcifInput = document.getElementById('idcif');
+        const rfcInput = document.getElementById('rfc');
+
+        // ==================================================
+        // 1. VALIDADORES DE ENTRADA (Real-Time)
+        // ==================================================
+
+        // Validar ID CIF: Permitir solo números y teclas de control
+        idcifInput.addEventListener('keydown', function(e) {
+             // 1. Permitir atajos: Ctrl/Cmd + (C, V, A, X, etc.)
+            if (e.ctrlKey || e.metaKey) {
+                return;
+            }
+            // 2. Permitir teclas especiales de navegación y edición
+            // 46=Supr, 8=Backspace, 9=Tab, 27=Esc, 13=Enter, 35=End, 36=Home, 37=Left, 38=Up, 39=Right, 40=Down
+            if ([46, 8, 9, 27, 13].indexOf(e.keyCode) !== -1 || (e.keyCode >= 35 && e.keyCode <= 40)) {
+                 return;
+            }
+
+            // 3. Bloquear todo lo que NO sea número (Teclado superior 48-57, Numpad 96-105)
+            if ((e.shiftKey || (e.keyCode < 48 || e.keyCode > 57)) && (e.keyCode < 96 || e.keyCode > 105)) {
+                e.preventDefault();
+                Swal.fire({ toast: true, position: 'top-end', icon: 'error', title: 'Solo se permiten números', showConfirmButton: false, timer: 1500 });
+            }
+        });
+
+        // Limpieza adicional en el input (pegar texto con letras)
+        idcifInput.addEventListener('input', function() {
+           this.value = this.value.replace(/[^0-9]/g, '');
+        });
+
+        // Validar RFC: Mayúsculas y caracteres válidos
+        rfcInput.addEventListener('input', function(e) {
+            let val = this.value.toUpperCase();
+            // Evitar caracteres especiales raros (Solo permite A-Z, 0-9, &)
+            const cleanVal = val.replace(/[^A-Z&0-9]/g, '');
+            
+            if (val !== cleanVal) {
+                Swal.fire({
+                    toast: true,
+                    position: 'top-end',
+                    icon: 'error',
+                    title: 'Caracteres no permitidos',
+                    text: 'Solo se permiten letras (A-Z), números y &',
+                    showConfirmButton: false,
+                    timer: 2000
+                });
+                this.value = cleanVal;
+            } else {
+                this.value = val;
+            }
+            
+            // Validación visual de longitud
+            if(this.value.length > 0 && this.value.length < 12) {
+                this.classList.add('is-invalid');
+            } else {
+                this.classList.remove('is-invalid');
+            }
+        });
+
+        // Función para validación estricta de estructura RFC
+        function validateRfcStructure(rfc) {
+            // Regex Oficial SAT (modificado para no permitir Ñ): 
+            // Persona Física: 4 letras, 6 números (YYMMDD), 3 homoclave
+            // Persona Moral: 3 letras, 6 números (YYMMDD), 3 homoclave
+            const re = /^([A-Z&]{3,4})([0-9]{2})(0[1-9]|1[0-2])(0[1-9]|[12][0-9]|3[01])([A-Z0-9]{3})$/;
+            return re.test(rfc);
+        }
+
+        // ==================================================
+        // 2. MANEJO DEL ENVÍO (Submit Wrapper)
+        // ==================================================
+        form.addEventListener('submit', async function(e) {
+            e.preventDefault();
+
+            const idcif = idcifInput.value.trim();
+            const rfc = rfcInput.value.trim();
+
+            // A. Validar campos vacíos
+            if (!idcif || !rfc) {
+                Swal.fire({ icon: 'error', title: 'Campos Vacíos', text: 'Por favor ingrese tanto el ID CIF como el RFC.', confirmButtonColor: '#611232' });
+                return;
+            }
+
+            // B. Validaciones de formato finales
+            let isValid = true;
+            if(!/^\d+$/.test(idcif)) {
+                idcifInput.classList.add('is-invalid');
+                isValid = false;
+            }
+            
+            // Validación estricta de RFC
+            if(!validateRfcStructure(rfc)) {
+                rfcInput.classList.add('is-invalid');
+                isValid = false;
+                Swal.fire({ 
+                    icon: 'error', 
+                    title: 'Estructura de RFC Inválida', 
+                    html: `El RFC ingresado <b>"${rfc}"</b> no tiene el formato oficial esperado.<br><br>Recuerde:<br>• <b>Personas Físicas:</b> 4 letras, 6 números y 3 caracteres.<br>• <b>Personas Morales:</b> 3 letras, 6 números y 3 caracteres.`,
+                    confirmButtonColor: '#611232' 
+                });
+                return;
+            }
+
+            if (!isValid) {
+                Swal.fire({ icon: 'error', title: 'Datos Incompletos', text: 'Por favor verifique que los campos marcados en rojo sean correctos.', confirmButtonColor: '#611232' });
+                return;
+            }
+
+            // C. Preparar Interfaz para Carga
+            btnSearch.disabled = true;
+            btnText.textContent = 'PROCESANDO...';
+            spinner.classList.remove('d-none');
+            
+            // Ocultar resultados previos
+            resultsContainer.classList.add('d-none');
+            welcomeMessage.classList.add('d-none');
+            if(statusAlert) statusAlert.innerHTML = '';
+
+            const formData = new FormData();
+            formData.append('idcif', idcif);
+            formData.append('rfc', rfc);
+
+            try {
+                // D. Petición Asíncrona al Backend
+                const response = await fetch('index.php', { method: 'POST', body: formData });
+                
+                // Verificar tipo de contenido
+                const contentType = response.headers.get("content-type");
+                let result;
+                if (contentType && contentType.includes("application/json")) {
+                     result = await response.json();
+                } else {
+                     throw new Error("Respuesta inválida del servidor (HTML no esperado).");
+                }
+
+                if (!response.ok || result.error) {
+                    throw new Error(result.error || 'Error desconocido al consultar el SAT.');
+                }
+
+                // ==================================================
+                // 3. PROCESAMIENTO DE RESPUESTA EXITOSA
+                // ==================================================
+                
+                // Actualizar Estado Global de la App (Usado por app.js para el PDF)
+                window.SatApp = result; 
+
+                // Renderizar Alerta de Estado del Contribuyente
+                const situacion = result.data['Situación del contribuyente'] || 'DESCONOCIDO';
+                const situacionUpper = situacion.toUpperCase();
+                let alertClass = 'alert-info';
+                let iconClass = 'bi-info-circle-fill';
+                let title = 'Aviso';
+                let extraNote = '';
+
+                if (situacionUpper.includes('ACTIVO') || situacionUpper.includes('REACTIVADO')) {
+                    alertClass = 'alert-success';
+                    iconClass = 'bi-check-circle-fill';
+                    title = 'Contribuyente Localizado';
+                } else if (situacionUpper.includes('SUSPENDIDO') || situacionUpper.includes('BAJA') || situacionUpper.includes('CANCELADO')) {
+                    alertClass = 'alert-warning';
+                    iconClass = 'bi-exclamation-triangle-fill';
+                    title = 'Atención: Estatus Irregular';
+                    extraNote = '<div class="mt-1 small text-dark opacity-75"><i class="bi bi-info-circle me-1"></i> Nota: Al estar <strong>SUSPENDIDO</strong>, este documento podría no ser válido para realizar ciertos trámites bancarios o legales.</div>';
+                }
+
+                if (statusAlert) {
+                    statusAlert.innerHTML = `
+                      <div class="alert ${alertClass} shadow-sm border-0" role="alert">
+                        <div class="d-flex align-items-center">
+                            <i class="bi ${iconClass} flex-shrink-0 me-3 fs-4"></i>
+                            <div>
+                                <h6 class="alert-heading fw-bold mb-1">${title}</h6>
+                                <div class="small">El contribuyente se encuentra: <strong>${situacion}</strong></div>
+                            </div>
+                        </div>
+                        ${extraNote}
+                      </div>
+                    `;
+                }
+
+                // Mostrar Contenedores
+                welcomeMessage.classList.add('d-none');
+                resultsContainer.classList.remove('d-none');
+                
+                // Iniciar Generación del PDF (Llamada a app.js)
+                if(typeof generatePdfPreview === 'function') {
+                    // Reiniciar visor para evitar cache visual
+                    const viewer = document.getElementById('pdfViewer');
+                    viewer.style.opacity = '0';
+                    viewer.src = 'about:blank';
+                    
+                    // Pequeño delay para asegurar renderizado del DOM
+                    setTimeout(() => generatePdfPreview(false, 'GENERANDO VISTA PREVIA...'), 100);
+                }
+
+            } catch (error) {
+                console.error(error);
+                Swal.fire({
+                    icon: 'error',
+                    title: 'Error',
+                    html: error.message || 'No se pudo completar la solicitud.',
+                    confirmButtonColor: '#611232'
+                });
+                welcomeMessage.classList.remove('d-none');
+            } finally {
+                // E. Restaurar controles UI
+                btnSearch.disabled = false;
+                btnText.innerHTML = '<i class="bi bi-search"></i> GENERAR VALIDACIÓN';
+                spinner.classList.add('d-none');
+            }
+        });
+      });
+    </script>
+</body>
 </html>
+```

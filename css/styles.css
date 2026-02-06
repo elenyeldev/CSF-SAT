@@ -1,0 +1,41 @@
+:root{
+  --mx-guinda:#611232; --mx-guinda-osc:#4d0e28; --mx-oro:#B38E5D; --mx-verde:#0A8F32; --mx-vino-dark:#3A0B1F;
+}
+body { font-family: 'Roboto', sans-serif; }
+.brand-gradient{ background-color: var(--mx-guinda); }
+.brand-btn{ background-color:var(--mx-oro); color:#fff; border:none; transition: all 0.3s; }
+.brand-btn:hover{ background-color:#8e714a; color:#fff; transform: translateY(-1px); }
+.brand-accent{ color:var(--mx-oro); font-weight: 500;}
+.shcp-logo { font-size: 0.85rem; line-height: 1.1; }
+.shcp-sub { font-size: 0.65rem; opacity: 0.6; letter-spacing: 1px; }
+.card-shadow{ box-shadow:0 10px 25px rgba(0,0,0,.08); }
+.header-datos{ background-color: var(--mx-vino-dark) !important; }
+
+/* Estilo solicitado para botones de acción */
+.btn-descargar {
+    border: 2px solid var(--mx-guinda) !important;
+    background-color: transparent !important;
+    color: var(--mx-guinda) !important;
+    font-weight: bold;
+    transition: all 0.3s ease;
+    box-shadow: 0 0 0 0 var(--mx-guinda);
+}
+.btn-descargar:hover {
+    background-color: var(--mx-guinda) !important;
+    color: white !important;
+}
+.btn-refrescar {
+    border: 2px solid var(--mx-oro) !important;
+    background-color: transparent !important;
+    color: var(--mx-oro) !important;
+    font-weight: bold;
+}
+.btn-refrescar:hover {
+    background-color: var(--mx-oro) !important;
+    color: white !important;
+}
+.disabled {
+    opacity: 0.6 !important;
+    cursor: not-allowed !important;
+    pointer-events: none;
+}
